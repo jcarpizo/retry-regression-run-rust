@@ -5,7 +5,7 @@ use serde::{de::DeserializeOwned, Deserialize};
 use std::env;
 use tokio::time::{self, Duration};
 use urlencoding::encode;
-use anyhow::{Result, anyhow};
+use anyhow::{Result};
 
 #[derive(Debug, Deserialize)]
 struct JobList {
@@ -34,7 +34,7 @@ const JENKINS_URLS: [&str; 2] = [
 ];
 
 const USERNAME: &str = "jasper";
-const PASSWORD: &str = "11bbc6af0dd54621a97ecb0d601b95a8d1";
+const TOKEN_PASSWORD: &str = "11bbc6af0dd54621a97ecb0d601b95a8d1";
 
 struct Config<'a> {
     retry: bool,
@@ -46,7 +46,7 @@ fn create_easy_handle(url: &str) -> Result<Easy, curl::Error> {
     let mut handle = Easy::new();
     handle.url(url)?;
     handle.username(USERNAME)?;
-    handle.password(PASSWORD)?;
+    handle.password(TOKEN_PASSWORD)?;
     Ok(handle)
 }
 
@@ -140,7 +140,19 @@ async fn main() -> Result<()> {
     let excluded_names = [
         "02-(SEEKING-AUTHENTICATION)-Admin-Login-Google-Account_Test",
         "01-(SEEKING-OTP-AUTHENTICATION)-OTP-Login-Passwordless_Test",
-        // ... (shortened for brevity)
+        "02-(SEEKING-OTP-AUTHENTICATION)-Extend-OTP-Expiry-Time_Test",
+        "03-(SEEKING-OTP-AUTHENTICATION)-Join-Outsourcer_Test",
+        "01-(SEEKING-AUTO-MODERATE-PAS)-Seeking-Onboarding-ProfileWall-Invalid-Username_Test",
+        "02-(SEEKING-AUTO-MODERATE-PAS)-Admin-Sync-Profile-Moderate-Enabled_Test",
+        "03-(SEEKING-AUTO-MODERATE-PAS)-Auto-Moderation-Settings-Toggle_Test",
+        "01-(SEEKING-THANOS)-Thanos-Email-Suspend_Test",
+        "02-(SEEKING-THANOS)-Thanos-IP-Suspend_Test",
+        "03-(SEEKING-THANOS)-Thanos-Device-Fingerprinting-Suspend_Test",
+        "04-(SEEKING-THANOS)-Thanos-Email-IP_Test",
+        "05-(SEEKING-THANOS)-Thanos-Validation_Test",
+        "06-00-(SEEKING-THANOS)-Thanos-FraudML-Auto-Moderation-Met-Criteria_Test",
+        "06-01-(SEEKING-THANOS)-Thanos-FraudML-Auto-Moderation-Username-Not-Met-Criteria_Test",
+        "06-02-(SEEKING-THANOS)-Thanos-FraudML-Auto-Moderation-Not-Met-Criteria-Selfie-Compare-Faces_Test",
         "06-03-(SEEKING-THANOS)-Thanos-FraudML-Auto-Moderation-Disabled_Test",
     ];
 
