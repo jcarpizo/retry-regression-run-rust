@@ -5,8 +5,11 @@ use once_cell::sync::Lazy;
 use regex::Regex;
 use serde::{de::DeserializeOwned, Deserialize};
 use std::{env, io::{stdout, Write}};
+use colored::Colorize;
 use tokio::time::{self, Duration};
 use urlencoding::encode;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 // ============================
 // Constants & Lazy Statics
@@ -125,7 +128,7 @@ mod jenkins {
         let mut handle = create_easy_handle(&url)?;
         handle.post(true)?;
         handle.perform()?;
-        println!("🔁 Retried job: {}\n", job_name);
+        println!("Retried job => {}", job_name.black().on_bright_green());
         Ok(())
     }
 }
@@ -176,10 +179,12 @@ fn parse_arguments() -> Config<'static> {
 async fn main() -> Result<()> {
     let config = parse_arguments();
     let mut interval = time::interval(Duration::from_secs(config.retry_interval));
+    let counter = Arc::new(AtomicUsize::new(1));
 
     loop {
         interval.tick().await;
         clear_screen();
+        counter.store(0, Ordering::Relaxed);
         println!("🟢 Monitoring Jenkins: {}\n⏱ Interval: {} seconds\n", config.base_url, config.retry_interval);
 
         let jobs = jenkins::get_jobs(&config).await?.jobs;
@@ -199,17 +204,20 @@ async fn main() -> Result<()> {
             let config = &config;
             let name = job.name.clone();
             let url = job.url.clone();
+            let counter = Arc::clone(&counter);
 
             futures.push(async move {
                 match jenkins::get_job_status(config, &name).await {
                     Ok(status) if matches!(status.result.as_deref(), Some("FAILURE")) => {
-                        println!("❌ Job: {}\n   In Progress: {}\n   Url: {}\n", name, status.inProgress, url);
+                        let current = counter.fetch_add(1, Ordering::Relaxed);
+                        println!("{}. job: {} => url: {}", current, name.red(), url.italic().yellow());
                         if config.retry {
                             let _ = jenkins::retry_job(config, &name).await;
                         }
                     }
                     Ok(status) if status.result.is_none() && status.inProgress => {
-                        println!("⏳ Job: {} is still IN PROGRESS\n", name);
+                        let current = counter.fetch_add(1, Ordering::Relaxed);
+                        println!("{}. job: {} => url: {}", current, name.green(), url.italic().yellow());
                     }
                     Err(e) => eprintln!("⚠️  Error: {}: {}", name, e),
                     _ => {}
