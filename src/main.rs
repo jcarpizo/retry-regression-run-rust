@@ -1,11 +1,51 @@
+use anyhow::{Result};
 use curl::easy::Easy;
 use futures::stream::{FuturesUnordered, StreamExt};
+use once_cell::sync::Lazy;
 use regex::Regex;
 use serde::{de::DeserializeOwned, Deserialize};
-use std::env;
+use std::{env, io::{stdout, Write}};
 use tokio::time::{self, Duration};
 use urlencoding::encode;
-use anyhow::{Result};
+
+// ============================
+// Constants & Lazy Statics
+// ============================
+
+const JENKINS_URLS: [&str; 2] = [
+    "http://10.40.1.11:8080/view/Seeking%20API%20Test",
+    "http://10.40.1.11:8080/view/Seeking%20Functional",
+];
+
+const USERNAME: &str = "jasper";
+const TOKEN: &str = "11bbc6af0dd54621a97ecb0d601b95a8d1";
+
+static EXCLUDE_REGEX: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?i)(_start_test_suite|-test-suite-start)").unwrap()
+});
+
+static EXCLUDED_NAMES: Lazy<Vec<&str>> = Lazy::new(|| vec![
+    "02-(SEEKING-AUTHENTICATION)-Admin-Login-Google-Account_Test",
+    "01-(SEEKING-OTP-AUTHENTICATION)-OTP-Login-Passwordless_Test",
+    "02-(SEEKING-OTP-AUTHENTICATION)-Extend-OTP-Expiry-Time_Test",
+    "03-(SEEKING-OTP-AUTHENTICATION)-Join-Outsourcer_Test",
+    "01-(SEEKING-AUTO-MODERATE-PAS)-Seeking-Onboarding-ProfileWall-Invalid-Username_Test",
+    "02-(SEEKING-AUTO-MODERATE-PAS)-Admin-Sync-Profile-Moderate-Enabled_Test",
+    "03-(SEEKING-AUTO-MODERATE-PAS)-Auto-Moderation-Settings-Toggle_Test",
+    "01-(SEEKING-THANOS)-Thanos-Email-Suspend_Test",
+    "02-(SEEKING-THANOS)-Thanos-IP-Suspend_Test",
+    "03-(SEEKING-THANOS)-Thanos-Device-Fingerprinting-Suspend_Test",
+    "04-(SEEKING-THANOS)-Thanos-Email-IP_Test",
+    "05-(SEEKING-THANOS)-Thanos-Validation_Test",
+    "06-00-(SEEKING-THANOS)-Thanos-FraudML-Auto-Moderation-Met-Criteria_Test",
+    "06-01-(SEEKING-THANOS)-Thanos-FraudML-Auto-Moderation-Username-Not-Met-Criteria_Test",
+    "06-02-(SEEKING-THANOS)-Thanos-FraudML-Auto-Moderation-Not-Met-Criteria-Selfie-Compare-Faces_Test",
+    "06-03-(SEEKING-THANOS)-Thanos-FraudML-Auto-Moderation-Disabled_Test",
+]);
+
+// ============================
+// Data Structures
+// ============================
 
 #[derive(Debug, Deserialize)]
 struct JobList {
@@ -28,79 +68,95 @@ struct JobResult {
     inProgress: bool,
 }
 
-const JENKINS_URLS: [&str; 2] = [
-    "http://10.40.1.11:8080/view/Seeking%20API%20Test",
-    "http://10.40.1.11:8080/view/Seeking%20Functional",
-];
-
-const USERNAME: &str = "jasper";
-const TOKEN_PASSWORD: &str = "11bbc6af0dd54621a97ecb0d601b95a8d1";
-
 struct Config<'a> {
     retry: bool,
     base_url: &'a str,
     retry_interval: u64,
 }
 
-fn create_easy_handle(url: &str) -> Result<Easy, curl::Error> {
-    let mut handle = Easy::new();
-    handle.url(url)?;
-    handle.username(USERNAME)?;
-    handle.password(TOKEN_PASSWORD)?;
-    Ok(handle)
-}
+// ============================
+// Jenkins API Utilities
+// ============================
 
-async fn fetch_json<T: DeserializeOwned>(url: &str) -> Result<T> {
-    let mut data = Vec::new();
-    let mut handle = create_easy_handle(url)?;
-    {
-        let mut transfer = handle.transfer();
-        transfer.write_function(|new_data| {
-            data.extend_from_slice(new_data);
-            Ok(new_data.len())
-        })?;
-        transfer.perform()?;
+mod jenkins {
+    use super::*;
+
+    pub fn create_easy_handle(url: &str) -> Result<Easy> {
+        let mut handle = Easy::new();
+        handle.url(url)?;
+        handle.username(USERNAME)?;
+        handle.password(TOKEN)?;
+        Ok(handle)
     }
 
-    let body = std::str::from_utf8(&data).unwrap_or("").to_string();
+    pub async fn fetch_json<T: DeserializeOwned>(url: &str) -> Result<T> {
+        let mut data = Vec::new();
+        let mut handle = create_easy_handle(url)?;
 
-    serde_json::from_str(&body).or_else(|_| {
-        serde_json::from_str(r#"{"result": null, "inProgress": true}"#).map_err(|e| e.into())
-    })
+        {
+            let mut transfer = handle.transfer();
+            transfer.write_function(|chunk| {
+                data.extend_from_slice(chunk);
+                Ok(chunk.len())
+            })?;
+            transfer.perform()?;
+        }
+
+        let body = std::str::from_utf8(&data)?;
+        serde_json::from_str(body)
+            .or_else(|_| {
+                serde_json::from_str(r#"{"result": null, "inProgress": true}"#)
+                    .map_err(Into::into)
+            })
+    }
+
+    pub async fn get_jobs(config: &Config<'_>) -> Result<JobList> {
+        let url = format!("{}/api/json?tree=jobs[name,disabled,inQueue,url]", config.base_url);
+        fetch_json(&url).await
+    }
+
+    pub async fn get_job_status(config: &Config<'_>, job_name: &str) -> Result<JobResult> {
+        let url = format!("{}/job/{}/lastBuild/api/json", config.base_url, encode(job_name));
+        fetch_json(&url).await
+    }
+
+    pub async fn retry_job(config: &Config<'_>, job_name: &str) -> Result<()> {
+        let url = format!("{}/job/{}/buildWithParameters", config.base_url, encode(job_name));
+        let mut handle = create_easy_handle(&url)?;
+        handle.post(true)?;
+        handle.perform()?;
+        println!("🔁 Retried job: {}\n", job_name);
+        Ok(())
+    }
 }
 
-async fn get_jobs(config: &Config<'_>) -> Result<JobList> {
-    let url = format!("{}/api/json?tree=jobs[name,disabled,inQueue,url]", config.base_url);
-    fetch_json(&url).await
-}
+// ============================
+// Helpers
+// ============================
 
-async fn get_job_status(config: &Config<'_>, job_name: &str) -> Result<JobResult> {
-    let encoded = encode(job_name);
-    let url = format!("{}/job/{}/lastBuild/api/json", config.base_url, encoded);
-    fetch_json(&url).await
-}
+fn clear_screen() {
+    #[cfg(windows)]
+    let _ = Command::new("cmd").args(["/C", "cls"]).status();
 
-async fn retry_job(config: &Config<'_>, job_name: &str) -> Result<()> {
-    let encoded = encode(job_name);
-    let url = format!("{}/job/{}/buildWithParameters", config.base_url, encoded);
-    let mut handle = create_easy_handle(&url)?;
-    handle.post(true)?;
-    handle.perform()?;
-    println!("🔁 Retried job: {}\n", job_name);
-    Ok(())
+    #[cfg(unix)]
+    {
+        print!("\x1B[2J\x1B[H");
+        let _ = stdout().flush();
+    }
 }
 
 fn parse_arguments() -> Config<'static> {
     let args: Vec<String> = env::args().collect();
-    let url_index = args.iter().position(|arg| arg == "--url")
-        .and_then(|i| args.get(i + 1))
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(0)
-        .min(1);
 
-    let retry_interval = args.iter().position(|arg| arg == "--interval")
-        .and_then(|i| args.get(i + 1))
-        .and_then(|v| v.parse::<u64>().ok())
+    let url_index = args.windows(2)
+        .find(|w| w[0] == "--url")
+        .and_then(|w| w[1].parse::<usize>().ok())
+        .map(|i| i.min(JENKINS_URLS.len() - 1))
+        .unwrap_or(0);
+
+    let retry_interval = args.windows(2)
+        .find(|w| w[0] == "--interval")
+        .and_then(|w| w[1].parse::<u64>().ok())
         .unwrap_or(180);
 
     let retry = args.contains(&"--retry".to_string());
@@ -112,86 +168,52 @@ fn parse_arguments() -> Config<'static> {
     }
 }
 
-fn clear_screen() {
-    #[cfg(windows)]
-    {
-        let _ = std::process::Command::new("cmd")
-            .args(["/C", "cls"])
-            .status();
-    }
-
-    #[cfg(unix)]
-    {
-        // ANSI escape code to clear the screen and move cursor to top-left
-        print!("\x1B[2J\x1B[H");
-        use std::io::{stdout, Write};
-        let _ = stdout().flush(); // Ensure the clear command is immediately reflected
-    }
-}
-
+// ============================
+// Main Logic
+// ============================
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let config = parse_arguments();
-
-    let exclude = Regex::new(r"(?i)(_start_test_suite|-test-suite-start)")?;
     let mut interval = time::interval(Duration::from_secs(config.retry_interval));
 
-    let excluded_names = [
-        "02-(SEEKING-AUTHENTICATION)-Admin-Login-Google-Account_Test",
-        "01-(SEEKING-OTP-AUTHENTICATION)-OTP-Login-Passwordless_Test",
-        "02-(SEEKING-OTP-AUTHENTICATION)-Extend-OTP-Expiry-Time_Test",
-        "03-(SEEKING-OTP-AUTHENTICATION)-Join-Outsourcer_Test",
-        "01-(SEEKING-AUTO-MODERATE-PAS)-Seeking-Onboarding-ProfileWall-Invalid-Username_Test",
-        "02-(SEEKING-AUTO-MODERATE-PAS)-Admin-Sync-Profile-Moderate-Enabled_Test",
-        "03-(SEEKING-AUTO-MODERATE-PAS)-Auto-Moderation-Settings-Toggle_Test",
-        "01-(SEEKING-THANOS)-Thanos-Email-Suspend_Test",
-        "02-(SEEKING-THANOS)-Thanos-IP-Suspend_Test",
-        "03-(SEEKING-THANOS)-Thanos-Device-Fingerprinting-Suspend_Test",
-        "04-(SEEKING-THANOS)-Thanos-Email-IP_Test",
-        "05-(SEEKING-THANOS)-Thanos-Validation_Test",
-        "06-00-(SEEKING-THANOS)-Thanos-FraudML-Auto-Moderation-Met-Criteria_Test",
-        "06-01-(SEEKING-THANOS)-Thanos-FraudML-Auto-Moderation-Username-Not-Met-Criteria_Test",
-        "06-02-(SEEKING-THANOS)-Thanos-FraudML-Auto-Moderation-Not-Met-Criteria-Selfie-Compare-Faces_Test",
-        "06-03-(SEEKING-THANOS)-Thanos-FraudML-Auto-Moderation-Disabled_Test",
-    ];
-
-    println!("🟢 Monitoring Jenkins at: {}\n⏱  Every {} seconds\n", config.base_url, config.retry_interval);
+    println!("🟢 Monitoring Jenkins: {}\n⏱ Interval: {} seconds\n", config.base_url, config.retry_interval);
 
     loop {
         interval.tick().await;
         clear_screen();
 
-        let job_list = get_jobs(&config).await?;
+        let jobs = jenkins::get_jobs(&config).await?.jobs;
 
-        let jobs_to_check: Vec<_> = job_list.jobs.into_iter()
-            .filter(|job| {
-                !job.disabled
-                    && !job.inQueue
-                    && !exclude.is_match(&job.name)
-                    && !excluded_names.contains(&job.name.as_str())
+        let filtered_jobs: Vec<_> = jobs.into_iter()
+            .filter(|j| {
+                !j.disabled &&
+                    !j.inQueue &&
+                    !EXCLUDE_REGEX.is_match(&j.name) &&
+                    !EXCLUDED_NAMES.contains(&j.name.as_str())
             })
             .collect();
 
         let mut futures = FuturesUnordered::new();
 
-        for job in jobs_to_check {
+        for job in filtered_jobs {
             let config = &config;
             let name = job.name.clone();
             let url = job.url.clone();
+
             futures.push(async move {
-                match get_job_status(config, &name).await {
-                    Ok(status) => {
-                        if status.result.as_deref() == Some("FAILURE") {
-                            println!("❌ Job: {}\n   In Progress: {}\n   Url: {}\n", name, status.inProgress, url);
-                            if config.retry {
-                                let _ = retry_job(config, &name).await;
-                            }
-                        } else if status.result.is_none() && status.inProgress {
-                            println!("⏳ Job: {} is still IN PROGRESS\n", name);
+                match jenkins::get_job_status(config, &name).await {
+                    Ok(status) if matches!(status.result.as_deref(), Some("FAILURE")) => {
+                        println!("❌ Job: {}\n   In Progress: {}\n   Url: {}\n", name, status.inProgress, url);
+                        if config.retry {
+                            let _ = jenkins::retry_job(config, &name).await;
                         }
                     }
-                    Err(e) => eprintln!("⚠️  Error fetching job status: {}: {}", name, e),
+                    Ok(status) if status.result.is_none() && status.inProgress => {
+                        println!("⏳ Job: {} is still IN PROGRESS\n", name);
+                    }
+                    Err(e) => eprintln!("⚠️  Error: {}: {}", name, e),
+                    _ => {}
                 }
             });
         }
