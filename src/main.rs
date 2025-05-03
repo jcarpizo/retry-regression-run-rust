@@ -177,11 +177,10 @@ async fn main() -> Result<()> {
     let config = parse_arguments();
     let mut interval = time::interval(Duration::from_secs(config.retry_interval));
 
-    println!("🟢 Monitoring Jenkins: {}\n⏱ Interval: {} seconds\n", config.base_url, config.retry_interval);
-
     loop {
         interval.tick().await;
         clear_screen();
+        println!("🟢 Monitoring Jenkins: {}\n⏱ Interval: {} seconds\n", config.base_url, config.retry_interval);
 
         let jobs = jenkins::get_jobs(&config).await?.jobs;
 
