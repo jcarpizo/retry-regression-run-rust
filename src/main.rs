@@ -4,10 +4,11 @@ use regex::Regex;
 use serde::{Deserialize, de::DeserializeOwned};
 use tokio::time::{self, Duration};
 use urlencoding::encode;
-use futures::stream::{FuturesUnordered, StreamExt};
 use colored::Colorize;
 use once_cell::sync::Lazy;
 use reqwest::Client;
+use tokio::time::sleep;
+use tokio::sync::Semaphore;
 use std::{
     env,
     io::{stdout, Write},
@@ -20,10 +21,11 @@ use std::{
 const USERNAME: &str = "jasper";
 const TOKEN: &str = "1109f682436aa407902fc02e67f97d8e72";
 
-const JENKINS_URLS: [&str; 3] = [
+const JENKINS_URLS: [&str; 4] = [
     "http://10.40.1.11:8080/view/Seeking%20API%20Test",
     "http://10.40.1.11:8080/view/Seeking%20Functional",
     "http://10.40.1.11:8080/view/SAMessage",
+    "http://10.40.1.11:8080/view/WYP%20Functional"
 ];
 
 static EXCLUDED_MODULES: Lazy<Vec<&str>> = Lazy::new(|| vec![
@@ -111,7 +113,7 @@ mod jenkins {
             .or_else(|_| serde_json::from_str(r#"{"result": null, "inProgress": true}"#).map_err(Into::into))
     }
 
-    pub async fn get_jobs(config: &Config) -> Result<JobList> {
+    pub async fn get_all_listed_jobs(config: &Config) -> Result<JobList> {
         let url = format!(
             "{}/api/json?tree=jobs[name,fullDisplayName,disabled,inQueue,url]",
             config.base_url
@@ -119,17 +121,22 @@ mod jenkins {
         fetch_json(&url).await
     }
 
-    pub async fn get_job_status(config: &Config, job_name: &str) -> Result<JobResult> {
+    pub async fn get_job_status_details(config: &Config, job_name: &str) -> Result<JobResult> {
         let url = format!("{}/job/{}/lastBuild/api/json", config.base_url, encode(job_name));
         fetch_json(&url).await
     }
 
-    pub async fn retry_job(config: &Config, job_name: &str) -> Result<()> {
+    pub async fn post_retry_failed_job(config: &Config, job_name: &str, job_url: &str) -> Result<()> {
         let url = format!("{}/job/{}/buildWithParameters", config.base_url, encode(job_name));
         let mut handle = create_easy_handle(&url)?;
         handle.post(true)?;
         handle.perform()?;
-        println!("🔁 Retried: {}", job_name.black().on_bright_green());
+        println!(
+            "=> {}: {} => {}",
+            "Retried".white(),
+            job_name.green(),
+            job_url.italic().bright_black(),
+        );
         Ok(())
     }
 }
@@ -162,6 +169,24 @@ fn parse_arguments() -> Arc<Config> {
     })
 }
 
+fn print_job_status_details(index: usize, job_name: &str, job_url: &str, status: &str) {
+    match status {
+        "FAILURE" => println!(
+            "{}. {} => {}",
+            index,
+            job_name.red(),
+            job_url.italic().bright_black()
+        ),
+        "IN_PROGRESS" => println!(
+            "{}. {} => {}",
+            index,
+            job_name.yellow(),
+            job_url.italic().bright_black(),
+        ),
+        _ => {}
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let config = parse_arguments();
@@ -173,15 +198,16 @@ async fn main() -> Result<()> {
         clear_screen();
         counter.store(1, Ordering::Relaxed);
         println!(
-            "🟢 Monitoring: {} => Seconds Interval: {}s\n😎 Created by: {} with using {} [ {} ]",
-            config.base_url,
+            "{}\n🟢 🚀 SA Regression RUN - Retry Failed Jobs Tool: {} | Refresh Interval in Seconds: {} | Is Retry: {} : {} 🦀\n{}",
+            "=".repeat(171).green().bold(),
+            config.base_url.green().bold(),
             config.retry_interval,
-            "Jasper Carpizo",
-            "RUST",
-            "https://www.rust-lang.org"
+            config.retry.to_string().green().bold(),
+            "Language: Rust",
+            "=".repeat(171).green().bold(),
         );
 
-        let jobs = jenkins::get_jobs(&config).await?.jobs;
+        let jobs = jenkins::get_all_listed_jobs(&config).await?.jobs;
 
         let filtered_jobs = jobs.into_iter().filter(|j| {
             !j.disabled &&
@@ -192,32 +218,43 @@ async fn main() -> Result<()> {
                 !EXCLUDED_MODULES.iter().any(|prefix| j.fullDisplayName.contains(prefix))
         });
 
-        let mut futures = FuturesUnordered::new();
+        let semaphore = Arc::new(Semaphore::new(5)); // limit to 5 concurrent jobs
+        let mut futures = vec![];
 
         for job in filtered_jobs {
-            let config = Arc::clone(&config);
-            let counter = Arc::clone(&counter);
+            let config = config.clone();
+            let counter = counter.clone();
+            let semaphore = semaphore.clone();
+            let job_name = job.fullDisplayName.clone();
+            let job_url = job.url.clone();
 
-            futures.push(async move {
-                match jenkins::get_job_status(&config, &job.fullDisplayName).await {
+            let permit = semaphore.acquire_owned().await?;
+
+            futures.push(tokio::spawn(async move {
+                let _permit = permit; // hold semaphore until this task finishes
+
+                sleep(Duration::from_millis(100)).await; // delay before fetching
+
+                match jenkins::get_job_status_details(&config, &job_name).await {
                     Ok(status) => {
                         let result = status.result.as_deref();
                         if result == Some("FAILURE") {
                             let i = counter.fetch_add(1, Ordering::Relaxed);
-                            println!("{}. ❌  {} => {}", i, job.fullDisplayName.red(), job.url.italic().yellow());
+                            print_job_status_details(i, &job_name, &job_url, "FAILURE");
+
                             if config.retry {
-                                let _ = jenkins::retry_job(&config, &job.fullDisplayName).await;
+                                let _ = jenkins::post_retry_failed_job(&config, &job_name,  &job_url).await;
                             }
                         } else if result.is_none() && status.inProgress {
                             let i = counter.fetch_add(1, Ordering::Relaxed);
-                            println!("{}. 🟡 {} => {}", i, job.fullDisplayName.green(), job.url.italic().yellow());
+                            print_job_status_details(i, &job_name, &job_url, "IN_PROGRESS");
                         }
                     }
-                    Err(e) => eprintln!("⚠️  {} => {}", job.fullDisplayName, e),
+                    Err(e) => eprintln!("⚠️  {} => {}", job_name, e),
                 }
-            });
+            }));
         }
 
-        while futures.next().await.is_some() {}
+        futures::future::join_all(futures).await;
     }
 }
